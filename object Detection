@@ -1,0 +1,864 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import cv2
+import numpy as np
+from ultralytics import YOLO
+import os
+import time
+import threading
+import queue
+import paho.mqtt.client as mqtt
+from typing import List, Dict, Tuple
+import logging
+from collections import deque
+import torch
+import psutil
+import gc
+from scipy.spatial.distance import cdist
+from scipy.optimize import linear_sum_assignment
+import subprocess
+
+# ==================== Jetson 優化 ====================
+cv2.setNumThreads(1)
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+torch.backends.cudnn.benchmark = True
+ENABLE_CPU_AFFINITY = False
+
+# ==================== 解析度配置 ====================
+INFERENCE_SIZE = 640
+DISPLAY_SIZE = (1920, 1080)
+
+# ==================== 基礎配置參數 ====================
+MODEL_PATH = os.path.expanduser("~/AI_Model/best.engine")
+CONF_THRESH = 0.45
+IOU_THRESH = 0.50
+FRAME_BUFFER_SIZE = 4
+RESULT_BUFFER_SIZE = 2
+MAX_FPS = 60
+FRAME_EXPIRE_TIME = 0.3
+
+# ==================== MQTT 設定 ====================
+MQTT_HOST = "e26af01437464cfd887d1a7c56bf5bf7.s1.eu.hivemq.cloud"
+MQTT_PORT = 8883
+MQTT_USER = "person"
+MQTT_PASS = "Ccvsinf2025"
+MQTT_TOPIC = "classroom/status"
+MQTT_SEND_INTERVAL = 0.5
+
+# ==================== 攝影機設定 ====================
+MIRROR_HORIZONTAL = False
+CAMERA_WIDTH = 1920
+CAMERA_HEIGHT = 1080
+CAMERA_FPS = 60
+CAMERA_FOURCC = 'MJPG'
+
+# ==================== 偵測參數 ====================
+MIN_BOX_AREA = 400
+MAX_BOX_AREA = 100000
+MIN_CONFIDENCE = 0.50
+MIN_ASPECT_RATIO = 0.2
+MAX_ASPECT_RATIO = 5.0
+
+# ==================== 穩定性參數 ====================
+STATUS_STABILITY_FRAMES = 3
+STABILITY_THRESHOLD = 0.8
+
+# ==================== 強光補償設定 ====================
+ENABLE_GAMMA = True
+GAMMA_VALUE = 1.5
+
+# ==================== 智慧曝光設定 ====================
+ENABLE_SMART_EXPOSURE = True
+TARGET_BRIGHTNESS = 140
+BRIGHTNESS_TOLERANCE = 10
+EXPOSURE_UPDATE_INTERVAL = 0.2
+EXPOSURE_SMOOTH_FACTOR = 0.95
+KP_EXPOSURE = 0.4
+SKIP_INITIAL_FRAMES = 30
+
+# ==================== 記憶體管理 ====================
+ENABLE_MEMORY_MANAGEMENT = True
+MEMORY_CLEANUP_INTERVAL = 60
+MEMORY_WARNING_THRESHOLD = 80
+
+logging.basicConfig(level=logging.WARNING)
+logger = logging.getLogger(__name__)
+
+# ==================== 攝影機控制器 ====================
+class CameraController:
+    def __init__(self, device="/dev/video0", verbose=False):
+        self.device = device
+        self.verbose = verbose
+    
+    def run_v4l2(self, cmd_args):
+        try:
+            result = subprocess.run(
+                ["v4l2-ctl", "-d", self.device] + cmd_args,
+                capture_output=True, text=True, timeout=3
+            )
+            return result.stdout.strip()
+        except:
+            return None
+    
+    def set_manual_mode(self):
+        self.run_v4l2(["--set-ctrl", "auto_exposure=1"])
+    
+    def set_exposure_time(self, value):
+        self.run_v4l2(["--set-ctrl", f"exposure_time_absolute={int(value)}"])
+    
+    def get_exposure_time(self):
+        result = self.run_v4l2(["--get-ctrl", "exposure_time_absolute"])
+        if result and ':' in result:
+            return int(result.split(":")[-1].strip())
+        return None
+    
+    def set_brightness(self, value):
+        value = int(np.clip(value, -64, 64))
+        self.run_v4l2(["--set-ctrl", f"brightness={value}"])
+    
+    def get_brightness_ctrl(self):
+        result = self.run_v4l2(["--get-ctrl", "brightness"])
+        if result and ':' in result:
+            return int(result.split(":")[-1].strip())
+        return 0
+    
+    def set_gain(self, value):
+        value = int(np.clip(value, 0, 255))
+        self.run_v4l2(["--set-ctrl", f"gain={value}"])
+    
+    def get_gain(self):
+        result = self.run_v4l2(["--get-ctrl", "gain"])
+        if result and ':' in result:
+            return int(result.split(":")[-1].strip())
+        return 32
+
+# ==================== 智慧曝光控制器 ====================
+class SmartExposureController:
+    def __init__(self, device="/dev/video0"):
+        self.cam = CameraController(device)
+        self.target_brightness = TARGET_BRIGHTNESS
+        self.tolerance = BRIGHTNESS_TOLERANCE
+        self.kp_exposure = KP_EXPOSURE
+        self.kp_brightness = 0.8
+        self.kp_gain = 1.0
+        self.smooth = EXPOSURE_SMOOTH_FACTOR
+        self.update_interval = EXPOSURE_UPDATE_INTERVAL
+        self.max_step_exposure = 30
+        self.max_step_brightness = 10
+        self.current_brightness = 0
+        self.last_error = 0
+        self.last_smoothed_exposure = 100
+        self.smoothed_exposure = 100
+        self.last_smoothed_brightness = 0
+        self.smoothed_brightness = 0
+        self.smoothed_gain = 32
+        self.overexposed_count = 0
+        self.last_update_time = time.time()
+        self.brightness_buffer = deque(maxlen=20)
+        self.is_stable = False
+        self.frame_count = 0
+        self.initialized = False
+    
+    def initialize(self, cap):
+        self.cam.set_manual_mode()
+        time.sleep(0.5)
+        
+        exp_time = self.cam.get_exposure_time()
+        if exp_time:
+            self.smoothed_exposure = float(exp_time)
+            self.last_smoothed_exposure = float(exp_time)
+        else:
+            self.smoothed_exposure = 150.0
+            self.last_smoothed_exposure = 150.0
+            self.cam.set_exposure_time(150)
+        
+        brightness = self.cam.get_brightness_ctrl()
+        self.smoothed_brightness = float(brightness)
+        self.last_smoothed_brightness = float(brightness)
+        
+        gain = self.cam.get_gain()
+        self.smoothed_gain = float(gain)
+        
+        print(f"✓ 融合曝光初始化完成 (曝光:{self.smoothed_exposure:.0f}, 亮度:{self.smoothed_brightness:.0f})")
+        self.initialized = True
+    
+    def process_frame(self, frame):
+        self.frame_count += 1
+        
+        if self.frame_count <= SKIP_INITIAL_FRAMES:
+            return
+        
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        self.current_brightness = np.mean(gray)
+        
+        self.brightness_buffer.append(self.current_brightness)
+        
+        if len(self.brightness_buffer) >= 15:
+            brightness_std = np.std(list(self.brightness_buffer)[-15:])
+            self.is_stable = brightness_std < 5
+        
+        saturated_ratio = np.sum(gray > 240) / gray.size
+        is_overexposed = saturated_ratio > 0.10
+        
+        if is_overexposed:
+            self.overexposed_count += 1
+        else:
+            self.overexposed_count = max(0, self.overexposed_count - 1)
+        
+        now = time.time()
+        should_update = (now - self.last_update_time) >= self.update_interval
+        
+        if should_update and self.is_stable:
+            error = self.target_brightness - self.current_brightness
+            self.last_error = error
+            
+            if abs(error) > self.tolerance:
+                if abs(error) > 30:
+                    exp_adj = self.kp_exposure * error
+                    exp_adj = np.clip(exp_adj, -self.max_step_exposure, self.max_step_exposure)
+                    new_exp = self.smoothed_exposure + exp_adj
+                    new_exp = np.clip(new_exp, 10, 500)
+                    self.smoothed_exposure = self.smooth * self.last_smoothed_exposure + (1 - self.smooth) * new_exp
+                
+                bright_adj = self.kp_brightness * error
+                bright_adj = np.clip(bright_adj, -self.max_step_brightness, self.max_step_brightness)
+                new_bright = self.smoothed_brightness + bright_adj
+                new_bright = np.clip(new_bright, -64, 64)
+                self.smoothed_brightness = self.smooth * self.last_smoothed_brightness + (1 - self.smooth) * new_bright
+                
+                if self.overexposed_count > 10:
+                    self.smoothed_exposure *= 0.95
+                    self.smoothed_brightness = min(self.smoothed_brightness, -10)
+                
+                self.last_smoothed_exposure = self.smoothed_exposure
+                self.last_smoothed_brightness = self.smoothed_brightness
+                
+                self.cam.set_exposure_time(self.smoothed_exposure)
+                self.cam.set_brightness(self.smoothed_brightness)
+                
+                self.last_update_time = now
+
+# ==================== 記憶體監控器 ====================
+class MemoryMonitor:
+    def __init__(self):
+        self.last_cleanup = time.time()
+    
+    def check_and_cleanup(self):
+        current_time = time.time()
+        
+        if torch.cuda.is_available():
+            gpu_allocated = torch.cuda.memory_allocated()
+            gpu_total = torch.cuda.get_device_properties(0).total_memory
+            gpu_usage_ratio = gpu_allocated / gpu_total * 100
+            
+            if gpu_usage_ratio > 80:
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
+                gc.collect()
+
+        if ENABLE_MEMORY_MANAGEMENT and current_time - self.last_cleanup > MEMORY_CLEANUP_INTERVAL:
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+                    gc.collect()
+                self.last_cleanup = current_time
+            except:
+                pass
+
+# ==================== Kalman 追蹤器 ====================
+class KalmanTracker:
+    def __init__(self, track_id, bbox, confidence):
+        self.track_id = track_id
+        self.bbox = bbox
+        self.confidence = confidence
+        self.age = 0
+        self.hits = 1
+        self.birth_time = time.time()
+        
+        self.kf = cv2.KalmanFilter(4, 2)
+        
+        dt = 1.0 / MAX_FPS
+        self.kf.transitionMatrix = np.array([
+            [1, 0, dt, 0],
+            [0, 1, 0, dt],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1]
+        ], dtype=np.float32)
+        
+        self.kf.measurementMatrix = np.array([
+            [1, 0, 0, 0],
+            [0, 1, 0, 0]
+        ], dtype=np.float32)
+        
+        self.kf.processNoiseCov = np.eye(4, dtype=np.float32) * 0.01
+        self.kf.measurementNoiseCov = np.eye(2, dtype=np.float32) * 10
+        
+        cx = (bbox[0] + bbox[2]) / 2
+        cy = (bbox[1] + bbox[3]) / 2
+        self.kf.statePost = np.array([[cx], [cy], [0], [0]], dtype=np.float32)
+    
+    def predict(self):
+        prediction = self.kf.predict()
+        return prediction[:2].flatten()
+    
+    def update(self, bbox, confidence):
+        cx = (bbox[0] + bbox[2]) / 2
+        cy = (bbox[1] + bbox[3]) / 2
+        
+        measurement = np.array([[cx], [cy]], dtype=np.float32)
+        self.kf.correct(measurement)
+        
+        self.bbox = bbox
+        self.confidence = max(self.confidence, confidence)
+        self.hits += 1
+        self.age = 0
+
+# ==================== 物件追蹤器 ====================
+class OptimizedTracker:
+    def __init__(self, max_distance=80.0, max_age=20, max_tracks=100):
+        self.tracks = {}
+        self.next_id = 1
+        self.max_distance = max_distance
+        self.max_age = max_age
+        self.max_tracks = max_tracks
+
+    def update(self, detections: List[Dict]) -> List[Dict]:
+        if not detections:
+            self._age_tracks()
+            return []
+
+        centers = np.array([((d['bbox'][0] + d['bbox'][2])/2, 
+                             (d['bbox'][1] + d['bbox'][3])/2) for d in detections])
+        
+        active_tracks = [(tid, t) for tid, t in self.tracks.items() if t.age == 0]
+        
+        if not active_tracks:
+            for i, det in enumerate(detections):
+                track_id = self.next_id
+                self.next_id += 1
+                self.tracks[track_id] = KalmanTracker(track_id, det['bbox'], det['confidence'])
+            self._age_tracks()
+            return detections
+        
+        track_preds = np.array([t.predict() for _, t in active_tracks])
+        distances = cdist(track_preds, centers)
+        
+        track_indices, det_indices = linear_sum_assignment(distances)
+        
+        matched_tracks = []
+        used_det_indices = set()
+        
+        for t_idx, d_idx in zip(track_indices, det_indices):
+            if distances[t_idx, d_idx] < self.max_distance:
+                track_id, track = active_tracks[t_idx]
+                det = detections[d_idx]
+                track.update(det['bbox'], det['confidence'])
+                
+                result_det = det.copy()
+                result_det['track_id'] = track_id
+                matched_tracks.append(result_det)
+                used_det_indices.add(d_idx)
+        
+        for i, det in enumerate(detections):
+            if i not in used_det_indices:
+                track_id = self.next_id
+                self.next_id += 1
+                self.tracks[track_id] = KalmanTracker(track_id, det['bbox'], det['confidence'])
+                
+                result_det = det.copy()
+                result_det['track_id'] = track_id
+                matched_tracks.append(result_det)
+        
+        self._age_tracks()
+        return matched_tracks
+
+    def _age_tracks(self):
+        to_remove = []
+        for track_id, track in self.tracks.items():
+            track.age += 1
+            if track.age > self.max_age:
+                to_remove.append(track_id)
+
+        for track_id in to_remove:
+            del self.tracks[track_id]
+        
+        if len(self.tracks) > self.max_tracks:
+            sorted_tracks = sorted(
+                self.tracks.items(), 
+                key=lambda x: x[1].birth_time
+            )
+            excess_count = len(self.tracks) - self.max_tracks
+            to_remove = [tid for tid, _ in sorted_tracks[:excess_count]]
+            for tid in to_remove:
+                del self.tracks[tid]
+
+# ==================== 4區塊分析器 ====================
+class FourZoneAnalyzer:
+    def __init__(self, width: int, height: int):
+        self.width = width
+        self.height = height
+        self.mid_x = width / 2
+        self.mid_y = height / 2
+        self.status_history = deque(maxlen=STATUS_STABILITY_FRAMES)
+
+    def get_zone_status(self, detections: List[Dict]) -> Tuple[str, bool]:
+        zones = {'bit1': 0, 'bit2': 0, 'bit3': 0, 'bit4': 0}
+
+        for det in detections:
+            x1, y1, x2, y2 = det['bbox']
+            center_x = (x1 + x2) / 2
+            center_y = (y1 + y2) / 2
+
+            if center_x >= self.mid_x:
+                if center_y < self.mid_y:
+                    zones['bit1'] = 1
+                else:
+                    zones['bit2'] = 1
+            else:
+                if center_y < self.mid_y:
+                    zones['bit3'] = 1
+                else:
+                    zones['bit4'] = 1
+
+        status_str = f"{zones['bit1']}{zones['bit2']}{zones['bit3']}{zones['bit4']}"
+        self.status_history.append(status_str)
+
+        if len(self.status_history) < STATUS_STABILITY_FRAMES:
+            return status_str, False
+
+        most_common = max(set(self.status_history), key=self.status_history.count)
+        stability_ratio = self.status_history.count(most_common) / len(self.status_history)
+        is_stable = stability_ratio >= STABILITY_THRESHOLD
+
+        return status_str, is_stable
+
+    def draw_zones(self, frame: np.ndarray):
+        h, w = frame.shape[:2]
+        mid_x, mid_y = int(w / 2), int(h / 2)
+
+        overlay = frame.copy()
+        cv2.line(overlay, (mid_x, 0), (mid_x, h), (100, 100, 100), 4)
+        cv2.line(overlay, (0, mid_y), (w, mid_y), (100, 100, 100), 4)
+        cv2.addWeighted(overlay, 0.5, frame, 0.5, 0, frame)
+
+# ==================== LEGO 偵測器 ====================
+class LegoDetector:
+    def __init__(self):
+        self.frame_queue = queue.Queue(maxsize=FRAME_BUFFER_SIZE)
+        self.result_queue = queue.Queue(maxsize=RESULT_BUFFER_SIZE)
+        self.mqtt_queue = queue.Queue(maxsize=10)
+        self.running = False
+        self.stop_event = threading.Event()
+
+        self.model = None
+        self.model_loaded = False
+        self.model_lock = threading.Lock()
+
+        self.tracker = OptimizedTracker()
+        self.zone_analyzer = FourZoneAnalyzer(CAMERA_WIDTH, CAMERA_HEIGHT)
+        self.smart_exposure = None
+        self.memory_monitor = MemoryMonitor()
+        
+        self.last_mqtt_send = 0
+        self.last_mqtt_status = None
+
+        self.fps_buffer = deque(maxlen=30)
+        self.stats = {
+            'fps': 0,
+            'inference_time': 0,
+            'last_frame_time': time.time(),
+            'frames_processed': 0,
+            'frames_captured': 0,
+            'errors_count': 0,
+            'frame_drops': 0
+        }
+
+        self.threads = []
+        
+        if ENABLE_GAMMA:
+            inv_gamma = 1.0 / GAMMA_VALUE
+            self.gamma_table = np.array([((i / 255.0) ** inv_gamma) * 255
+                                         for i in np.arange(0, 256)]).astype("uint8")
+        
+        self.inference_size = INFERENCE_SIZE
+        self.display_size = DISPLAY_SIZE
+        
+        print(f"📐 Jetson 模式: 推理 {self.inference_size}p, 顯示 {self.display_size}")
+
+    def _load_model_once(self):
+        with self.model_lock:
+            if self.model_loaded:
+                return True
+            
+            try:
+                self.model = YOLO(MODEL_PATH)
+                self.model_loaded = True
+
+                if torch.cuda.is_available():
+                    torch.cuda.set_device(0)
+                    torch.cuda.empty_cache()
+
+                dummy = np.zeros((self.inference_size, self.inference_size, 3), dtype=np.uint8)
+                _ = self.model.predict(dummy, verbose=False, device=0, conf=CONF_THRESH, iou=IOU_THRESH, half=True)
+                torch.cuda.synchronize()
+                print(f"✓ 模型載入 & CUDA 預熱完成")
+                
+                return True
+            except Exception as e:
+                logger.error(f"模型載入失敗: {e}")
+                self.model_loaded = False
+                return False
+
+    def preprocess_frame(self, frame: np.ndarray) -> np.ndarray:
+        if ENABLE_GAMMA:
+            frame = cv2.LUT(frame, self.gamma_table)
+        return frame
+
+    def postprocess(self, results, orig_w: int, orig_h: int) -> List[dict]:
+        detections = []
+        try:
+            boxes = results.boxes
+            if boxes is None or len(boxes) == 0:
+                return []
+
+            data = boxes.data.cpu().numpy()
+
+            # 信心值過濾
+            conf_mask = data[:, 4] >= MIN_CONFIDENCE
+            data = data[conf_mask]
+            if len(data) == 0:
+                return []
+
+            x1 = np.clip(data[:, 0], 0, orig_w - 1)
+            y1 = np.clip(data[:, 1], 0, orig_h - 1)
+            x2 = np.clip(data[:, 2], x1 + 1, orig_w)
+            y2 = np.clip(data[:, 3], y1 + 1, orig_h)
+            
+            data[:, 0:4] = np.stack([x1, y1, x2, y2], axis=1)
+
+            w = x2 - x1
+            h = y2 - y1
+            area = w * h
+
+            area_mask = (area >= MIN_BOX_AREA) & (area <= MAX_BOX_AREA)
+            data = data[area_mask]
+            w, h, area = w[area_mask], h[area_mask], area[area_mask]
+            if len(data) == 0:
+                return []
+
+            h_safe = np.where(h == 0, 1e-6, h)
+            aspect_ratio = w / h_safe
+            aspect_mask = (aspect_ratio >= MIN_ASPECT_RATIO) & (aspect_ratio <= MAX_ASPECT_RATIO)
+            
+            data = data[aspect_mask]
+            area = area[aspect_mask]
+            if len(data) == 0:
+                return []
+
+            for i in range(len(data)):
+                detections.append({
+                    'bbox': data[i, 0:4],
+                    'confidence': data[i, 4],
+                    'area': area[i]
+                })
+            
+            return detections
+
+        except Exception as e:
+            self.stats['errors_count'] += 1
+            return []
+
+    def _capture_worker(self):
+        cap = None
+        try:
+            cap = cv2.VideoCapture(0)
+            
+            fourcc = cv2.VideoWriter_fourcc(*CAMERA_FOURCC)
+            cap.set(cv2.CAP_PROP_FOURCC, fourcc)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+            cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+            if not cap.isOpened():
+                logger.error("無法開啟攝影機")
+                self.running = False
+                return
+
+            actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            actual_fps = cap.get(cv2.CAP_PROP_FPS)
+            print(f"✓ 攝影機設定: {actual_w}x{actual_h} @ {actual_fps} FPS (MJPG)")
+
+            if ENABLE_SMART_EXPOSURE:
+                self.smart_exposure = SmartExposureController()
+                self.smart_exposure.initialize(cap)
+                print(f"✓ 智慧曝光初始化完成 (將跳過前 {SKIP_INITIAL_FRAMES} 幀避免線條)")
+
+            frame_time = 1.0 / CAMERA_FPS
+            last_capture = time.time()
+            frame_count = 0
+
+            while self.running and not self.stop_event.is_set():
+                current = time.time()
+
+                if current - last_capture < frame_time:
+                    time.sleep(0.001)
+                    continue
+
+                ret, frame = cap.read()
+                if not ret:
+                    continue
+
+                if MIRROR_HORIZONTAL:
+                    frame = cv2.flip(frame, 1)
+
+                frame = self.preprocess_frame(frame)
+                
+                if self.smart_exposure:
+                    self.smart_exposure.process_frame(frame)
+                
+                frame_inference = cv2.resize(
+                    frame, 
+                    (self.inference_size, self.inference_size),
+                    interpolation=cv2.INTER_LINEAR
+                )
+
+                last_capture = current
+                frame_count += 1
+                self.stats['frames_captured'] = frame_count
+
+                try:
+                    self.frame_queue.put_nowait((frame, frame_inference, current))
+                except queue.Full:
+                    self.stats['frame_drops'] += 1
+                    pass
+                
+        except Exception as e:
+            logger.error(f"攝影機錯誤: {e}")
+            self.stats['errors_count'] += 1
+        finally:
+            if cap:
+                cap.release()
+
+    def _inference_worker(self):
+        inference_count = 0
+        try:
+            if not self._load_model_once():
+                logger.error("模型載入失敗")
+                self.running = False
+                return
+
+            while self.running and not self.stop_event.is_set():
+                try:
+                    frame_1080, frame_inference, timestamp = self.frame_queue.get(timeout=1.0)
+
+                    if time.time() - timestamp > FRAME_EXPIRE_TIME:
+                        continue
+
+                    inf_start = time.time()
+
+                    results = self.model.predict(
+                        source=frame_inference,
+                        conf=CONF_THRESH,
+                        iou=IOU_THRESH,
+                        device=0,
+                        half=True,
+                        imgsz=self.inference_size,
+                        verbose=False,
+                        agnostic_nms=True
+                    )
+
+                    self.stats['inference_time'] = (time.time() - inf_start) * 1000
+                    self.stats['frames_processed'] += 1
+
+                    detections = self.postprocess(results[0], self.inference_size, self.inference_size)
+                    detections = self.tracker.update(detections)
+                    
+                    zone_status, is_stable = self.zone_analyzer.get_zone_status(detections)
+
+                    current_time = time.time()
+                    should_send = (
+                        is_stable and
+                        zone_status != self.last_mqtt_status and
+                        current_time - self.last_mqtt_send > MQTT_SEND_INTERVAL
+                    )
+
+                    if should_send:
+                        try:
+                            self.mqtt_queue.put_nowait(zone_status)
+                            self.last_mqtt_send = current_time
+                            self.last_mqtt_status = zone_status
+                            print(f"📤 MQTT 發送: {zone_status}")
+                        except queue.Full:
+                            pass
+
+                    frame_delta = current_time - self.stats['last_frame_time']
+                    if frame_delta > 0:
+                        self.fps_buffer.append(1.0 / frame_delta)
+                    self.stats['fps'] = np.mean(self.fps_buffer) if len(self.fps_buffer) > 0 else 0
+                    self.stats['last_frame_time'] = current_time
+
+                    self.memory_monitor.check_and_cleanup()
+
+                    inference_count += 1
+
+                    try:
+                        result_data = {
+                            'frame': frame_1080,
+                            'detections': detections,
+                            'timestamp': timestamp,
+                            'orig_shape': (self.inference_size, self.inference_size),
+                            'fps': self.stats['fps']
+                        }
+                        self.result_queue.put_nowait(result_data)
+                    except queue.Full:
+                        pass
+
+                except queue.Empty:
+                    pass
+                except Exception as e:
+                    self.stats['errors_count'] += 1
+
+        finally:
+            print(f"✓ 推理線程停止 (處理 {inference_count} 幀)")
+
+    def _mqtt_worker(self):
+        client = None
+        try:
+            client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
+            client.username_pw_set(MQTT_USER, MQTT_PASS)
+            client.tls_set()
+
+            connected = False
+
+            def on_connect(c, userdata, flags, rc, properties=None):
+                nonlocal connected
+                connected = (rc == 0)
+                if connected:
+                    print(f"✓ MQTT 連線成功")
+
+            client.on_connect = on_connect
+
+            while self.running and not self.stop_event.is_set():
+                if not connected:
+                    try:
+                        client.connect(MQTT_HOST, MQTT_PORT, 60)
+                        client.loop_start()
+                    except Exception as e:
+                        time.sleep(5)
+
+                if connected:
+                    try:
+                        status = self.mqtt_queue.get(timeout=1.0)
+                        client.publish(MQTT_TOPIC, status, qos=1, retain=False)
+                    except queue.Empty:
+                        pass
+
+        finally:
+            if client:
+                client.loop_stop()
+                client.disconnect()
+
+    def start(self):
+        print("Jetson 系統啟動中...")
+        self.running = True
+        self.stop_event.clear()
+
+        t_cap = threading.Thread(target=self._capture_worker, daemon=True)
+        t_inf = threading.Thread(target=self._inference_worker, daemon=True)
+        t_mqtt = threading.Thread(target=self._mqtt_worker, daemon=True)
+        
+        self.threads = [t_cap, t_inf, t_mqtt]
+
+        for t in self.threads:
+            t.start()
+        
+        time.sleep(0.5)
+        print("✓ 線程啟動完成")
+
+    def stop(self):
+        self.running = False
+        self.stop_event.set()
+        
+        for t in self.threads:
+            t.join(timeout=3.0)
+
+        torch.cuda.empty_cache()
+        gc.collect()
+        
+        print("✓ 系統關閉")
+
+# ==================== 繪圖函式 ====================
+def draw_visuals(results: Dict, zone_analyzer: FourZoneAnalyzer) -> np.ndarray:
+    frame = results['frame']
+    detections = results['detections']
+    fps = results['fps']
+    inf_shape = results['orig_shape']
+    
+    h_1080, w_1080 = frame.shape[:2]
+    h_inf, w_inf = inf_shape
+    
+    scale_x = w_1080 / w_inf
+    scale_y = h_1080 / h_inf
+    
+    zone_analyzer.draw_zones(frame)
+
+    for det in detections:
+        x1, y1, x2, y2 = det['bbox']
+        conf = det['confidence']
+        
+        x1_disp = int(x1 * scale_x)
+        y1_disp = int(y1 * scale_y)
+        x2_disp = int(x2 * scale_x)
+        y2_disp = int(y2 * scale_y)
+        
+        color = (0, 255, 0)
+        cv2.rectangle(frame, (x1_disp, y1_disp), (x2_disp, y2_disp), color, 2)
+        
+        # 顯示信心值
+        label = f"{conf:.2f}"
+        cv2.putText(frame, label, (x1_disp, y1_disp - 10), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+    
+    cv2.putText(frame, f"FPS: {fps:.1f}", (10, 30), 
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+
+    return frame
+
+# ==================== 主程式 ====================
+def main():
+    detector = LegoDetector()
+    
+    try:
+        detector.start()
+        
+        print("\n按 q / ESC 退出\n")
+        
+        while detector.running:
+            try:
+                results = detector.result_queue.get(timeout=0.05)
+                
+                frame_to_show = draw_visuals(results, detector.zone_analyzer)
+                
+                cv2.imshow("LEGO Detector - Jetson", frame_to_show)
+                
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q') or key == 27:
+                    detector.stop()
+                    break
+
+            except queue.Empty:
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q') or key == 27:
+                    detector.stop()
+                    break
+                
+    except KeyboardInterrupt:
+        detector.stop()
+    finally:
+        cv2.destroyAllWindows()
+
+if __name__ == "__main__":
+    main()
